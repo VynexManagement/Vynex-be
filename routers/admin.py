@@ -105,6 +105,36 @@ async def update_user_role(
 
 # --- Endpoints: Scraper ---
 
+@router.get("/scraper/quota")
+async def get_scraper_quota(
+    admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase)
+):
+    try:
+        res = supabase.table("signals").select("*").eq("slug", "serpapi_quota").execute()
+        if not res.data:
+            # Seed default values: 250 limit, 2 consumed
+            insert_res = supabase.table("signals").insert({
+                "name": "SerpApi Quota",
+                "slug": "serpapi_quota",
+                "description": "250",
+                "rule_definition": "2",
+                "active": True,
+                "is_active": True,
+                "type": "system_meta"
+            }).execute()
+            quota = insert_res.data[0]
+        else:
+            quota = res.data[0]
+        
+        return {
+            "limit": int(quota.get("description") or 250),
+            "consumed": int(quota.get("rule_definition") or 2)
+        }
+    except Exception as e:
+        logger.error(f"Error getting scraper quota: {e}")
+        return {"limit": 250, "consumed": 2}
+
 active_tasks = {}
 
 @router.post("/scraper/run")
