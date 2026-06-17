@@ -213,7 +213,7 @@ async def _ensure_dataset(
         "query_hash": query_hash,
         "niche": niche_label,
         "country": country_label,
-        "signal": signal_label,
+        "signal_id": signal_ids[0] if signal_ids else None,
         "total_leads": total_leads,
         "price_inr": DEFAULT_PRICE_INR,
         "price_usd": DEFAULT_PRICE_USD,
@@ -233,7 +233,7 @@ async def _ensure_dataset(
                 {
                     "niche": row["niche"],
                     "country": row["country"],
-                    "signal": row["signal"],
+                    "signal_id": row["signal_id"],
                     "total_leads": total_leads,
                     "price_inr": DEFAULT_PRICE_INR,
                     "price_usd": DEFAULT_PRICE_USD,
@@ -318,6 +318,12 @@ async def get_preview(supabase: Client, query: QueryRequest) -> PreviewResponse:
     signal_texts = list(dict.fromkeys(unresolved)) if not merged_ids else []
 
     store_ids = await _store_ids_for_location(supabase, niches, countries)
+
+    if merged_ids:
+        signal_names = await _signal_labels(supabase, merged_ids)
+    else:
+        signal_names = signal_texts
+
     if store_ids is not None and len(store_ids) == 0:
         return PreviewResponse(
             dataset_id="",
@@ -325,23 +331,19 @@ async def get_preview(supabase: Client, query: QueryRequest) -> PreviewResponse:
             total_count=0,
             price_inr=DEFAULT_PRICE_INR,
             price_usd=DEFAULT_PRICE_USD,
-            niche=None,
-            country=None,
-            signal=None,
+            niche=niches[0] if len(niches) == 1 else None,
+            country=countries[0] if len(countries) == 1 else None,
+            signal=signal_names[0] if len(signal_names) == 1 else None,
             niches=niches,
             countries=countries,
             signal_ids=merged_ids,
-            signal_names=[],
+            signal_names=signal_names,
         )
 
     total_count = await _count_leads(supabase, store_ids, merged_ids, signal_texts)
     items = await _fetch_preview_items(
         supabase, store_ids, merged_ids, signal_texts, niches
     )
-    if merged_ids:
-        signal_names = await _signal_labels(supabase, merged_ids)
-    else:
-        signal_names = signal_texts
 
     qh = _canonical_hash(niches, countries, merged_ids, signal_texts)
     dataset_id = ""
