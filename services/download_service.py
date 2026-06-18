@@ -56,7 +56,7 @@ async def stream_csv(
     try:
         leads_res = (
             supabase.table("leads")
-            .select("signal, stores(name, url, country, niche, product_count, avg_price)")
+            .select("stores:stores!fk_leads_store(name, url, country, niche, product_count, avg_price), signals(name)")
             .in_("id", lead_ids)
             .execute()
         )
@@ -73,6 +73,8 @@ async def stream_csv(
 
     for lead in leads_res.data:
         store = lead.get("stores")
+        sig = lead.get("signals") or {}
+        signal_name = sig.get("name") or lead.get("signal") or ""
         if store:
             writer.writerow(
                 [
@@ -80,7 +82,7 @@ async def stream_csv(
                     store.get("url", ""),
                     store.get("country", ""),
                     store.get("niche", ""),
-                    lead.get("signal", ""),
+                    signal_name,
                     store.get("product_count", ""),
                     store.get("avg_price", ""),
                 ]
@@ -105,7 +107,7 @@ async def get_user_purchases(user_id: str, supabase: Client) -> list:
         res = (
             supabase.table("purchases")
             .select(
-                "id, dataset_id, payment_method, status, created_at, "
+                "id, dataset_id, payment_method, status, created_at, name, "
                 "datasets(niche, country, signal_id, total_leads, price_inr, price_usd)"
             )
             .eq("user_id", user_id)
@@ -114,8 +116,27 @@ async def get_user_purchases(user_id: str, supabase: Client) -> list:
             .execute()
         )
     except Exception as e:
-        logger.error(f"DB error fetching purchases for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch purchases.")
+        err_msg = str(e)
+        if "42703" in err_msg or "column purchases.name" in err_msg or "name" in err_msg:
+            logger.info("Missing 'name' column in purchases table. Falling back to query without 'name'.")
+            try:
+                res = (
+                    supabase.table("purchases")
+                    .select(
+                        "id, dataset_id, payment_method, status, created_at, "
+                        "datasets(niche, country, signal_id, total_leads, price_inr, price_usd)"
+                    )
+                    .eq("user_id", user_id)
+                    .eq("status", "completed")
+                    .order("created_at", desc=True)
+                    .execute()
+                )
+            except Exception as ex:
+                logger.error(f"Fallback DB query failed: {ex}")
+                raise HTTPException(status_code=500, detail="Failed to fetch purchases.")
+        else:
+            logger.error(f"DB error fetching purchases for user {user_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to fetch purchases.")
 
     signal_ids = {
         d.get("signal_id")
@@ -142,6 +163,7 @@ async def get_user_purchases(user_id: str, supabase: Client) -> list:
             {
                 "id": p["id"],
                 "dataset_id": p["dataset_id"],
+                "name": p.get("name"),
                 "niche": d.get("niche", ""),
                 "country": d.get("country", ""),
                 "signal": signal_map.get(d.get("signal_id"), "Unknown Signal"),
@@ -153,3 +175,115 @@ async def get_user_purchases(user_id: str, supabase: Client) -> list:
             }
         )
     return purchases
+
+
+async def rename_purchase(
+    purchase_id: str, user_id: str, name: str, supabase: Client
+) -> dict:
+    """Renames a purchase record for the user, verifying ownership."""
+    try:
+        check_res = (
+            supabase.table("purchases")
+            .select("id")
+            .eq("id", purchase_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"DB error checking purchase for rename: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+    if not check_res.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Purchase not found or access denied.",
+        )
+
+    try:
+        supabase.table("purchases").update({"name": name}).eq("id", purchase_id).execute()
+    except Exception as e:
+        err_msg = str(e)
+        if "42703" in err_msg or "column purchases.name" in err_msg or "name" in err_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="Dataset renaming is disabled because the database schema has not been updated. "
+                       "Please run the SQL migration (02_add_name_to_purchases.sql) in your Supabase editor."
+            )
+        logger.error(f"DB error renaming purchase {purchase_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to rename purchase.")
+
+    return {"success": True, "message": "Purchase renamed successfully."}
+
+
+async def get_purchase_leads(
+    purchase_id: str, user_id: str, supabase: Client
+) -> list:
+    """Returns all leads for a purchased dataset, joined with store and signal info."""
+    try:
+        purchase_res = (
+            supabase.table("purchases")
+            .select("dataset_id")
+            .eq("id", purchase_id)
+            .eq("user_id", user_id)
+            .eq("status", "completed")
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"DB error checking purchase for leads: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+    if not purchase_res.data:
+        raise HTTPException(
+            status_code=403,
+            detail="You have not purchased this dataset or it does not exist.",
+        )
+
+    dataset_id = purchase_res.data[0]["dataset_id"]
+
+    try:
+        dl_response = (
+            supabase.table("dataset_leads")
+            .select("lead_id")
+            .eq("dataset_id", dataset_id)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"DB error fetching dataset_leads: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+    lead_ids = [row["lead_id"] for row in dl_response.data]
+    if not lead_ids:
+        return []
+
+    try:
+        leads_res = (
+            supabase.table("leads")
+            .select(
+                "id, "
+                "stores:stores!fk_leads_store(name, url, country, niche, product_count, avg_price), "
+                "signals(name)"
+            )
+            .in_("id", lead_ids)
+            .execute()
+        )
+    except Exception as e:
+        logger.error(f"DB error fetching lead details: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+    leads = []
+    for lead in (leads_res.data or []):
+        store = lead.get("stores") or {}
+        sig = lead.get("signals") or {}
+        signal_name = sig.get("name") or lead.get("signal") or ""
+        leads.append({
+            "id": lead["id"],
+            "store_name": store.get("name", ""),
+            "url": store.get("url", ""),
+            "country": store.get("country", ""),
+            "niche": store.get("niche", ""),
+            "signal": signal_name,
+            "product_count": store.get("product_count"),
+            "avg_price": store.get("avg_price"),
+        })
+    return leads
+

@@ -2,6 +2,20 @@ import logging
 
 import razorpay
 import stripe
+import stripe.apps
+import stripe.billing_portal
+import stripe.checkout
+import stripe.climate
+import stripe.financial_connections
+import stripe.identity
+import stripe.issuing
+import stripe.radar
+import stripe.reporting
+import stripe.sigma
+import stripe.tax
+import stripe.terminal
+import stripe.test_helpers
+import stripe.treasury
 from fastapi import HTTPException
 from supabase import Client
 

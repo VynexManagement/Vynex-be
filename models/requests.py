@@ -45,3 +45,7 @@ class RazorpayVerifyRequest(BaseModel):
 class StripeConfirmRequest(BaseModel):
     payment_intent_id: str
     dataset_id: str
+
+
+class RenamePurchaseRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
