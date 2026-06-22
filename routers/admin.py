@@ -23,6 +23,18 @@ class ScraperRequest(BaseModel):
     signal: Optional[str] = None
     all_signals: bool = True
     limit: int = 50
+    concurrency: Optional[int] = None
+    retry_attempts: Optional[int] = None
+
+class RefreshStaleRequest(BaseModel):
+    freshness_threshold: int = 30
+    concurrency: int = 5
+    retry_attempts: int = 2
+
+class RetryStoreRequest(BaseModel):
+    url: str
+    niche: Optional[str] = "Unknown"
+    country: Optional[str] = "Unknown"
 
 class UserRoleUpdate(BaseModel):
     is_admin: bool
@@ -111,25 +123,23 @@ async def get_scraper_quota(
     supabase: Client = Depends(get_supabase)
 ):
     try:
-        res = supabase.table("signals").select("*").eq("slug", "serpapi_quota").execute()
+        res = supabase.table("api_quotas").select("*").eq("service", "serpapi").order("month_year", desc=True).execute()
         if not res.data:
             # Seed default values: 250 limit, 2 consumed
-            insert_res = supabase.table("signals").insert({
-                "name": "SerpApi Quota",
-                "slug": "serpapi_quota",
-                "description": "250",
-                "rule_definition": "2",
-                "active": True,
-                "is_active": True,
-                "type": "system_meta"
+            current_month = datetime.now().strftime("%Y-%m")
+            insert_res = supabase.table("api_quotas").insert({
+                "service": "serpapi",
+                "month_year": current_month,
+                "requests_used": 2,
+                "monthly_limit": 250
             }).execute()
             quota = insert_res.data[0]
         else:
             quota = res.data[0]
         
         return {
-            "limit": int(quota.get("description") or 250),
-            "consumed": int(quota.get("rule_definition") or 2)
+            "limit": int(quota.get("monthly_limit") or 250),
+            "consumed": int(quota.get("requests_used") or 0)
         }
     except Exception as e:
         logger.error(f"Error getting scraper quota: {e}")
@@ -141,6 +151,7 @@ active_tasks = {}
 async def run_scraper(
     req: ScraperRequest,
     admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
 ):
     """Triggers the scraper process and returns a task ID to poll for logs."""
     task_id = str(uuid.uuid4())
@@ -162,6 +173,11 @@ async def run_scraper(
         cmd.extend(["--signal", req.signal])
     else:
         raise HTTPException(status_code=400, detail="signal is required when all_signals is false")
+        
+    if req.concurrency:
+        cmd.extend(["--concurrency", str(req.concurrency)])
+    if req.retry_attempts:
+        cmd.extend(["--retry-attempts", str(req.retry_attempts)])
     
     try:
         # Start process and redirect stdout and stderr to the log file
@@ -174,6 +190,19 @@ async def run_scraper(
             )
         
         active_tasks[task_id] = process
+
+        # Insert run record in Supabase
+        try:
+            supabase.table("scraper_runs").insert({
+                "task_id": task_id,
+                "niche": req.niche,
+                "country": req.country,
+                "limit_count": req.limit,
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as db_err:
+            logger.error(f"Failed to insert scraper_runs record: {db_err}")
         
         return {
             "message": "Scraper started successfully",
@@ -187,12 +216,121 @@ async def run_scraper(
         )
 
 
+@router.post("/scraper/refresh-stale")
+async def refresh_stale_stores(
+    req: RefreshStaleRequest,
+    admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
+):
+    """Triggers the scraper process in refresh stale mode."""
+    task_id = str(uuid.uuid4())
+    log_file_path = os.path.join(LOG_DIR, f"{task_id}.log")
+    
+    scraper_script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scraper", "scraper.py")
+    
+    cmd = [
+        r"D:\Product\scraper\venv\Scripts\python.exe",
+        scraper_script,
+        "--refresh-stale",
+        "--all-signals",
+        "--freshness-threshold", str(req.freshness_threshold),
+        "--concurrency", str(req.concurrency),
+        "--retry-attempts", str(req.retry_attempts)
+    ]
+    
+    try:
+        with open(log_file_path, "w") as log_file:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(scraper_script)
+            )
+        active_tasks[task_id] = process
+
+        # Insert run record in Supabase
+        try:
+            supabase.table("scraper_runs").insert({
+                "task_id": task_id,
+                "niche": "Stale Refresh",
+                "country": "All",
+                "limit_count": None,
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as db_err:
+            logger.error(f"Failed to insert scraper_runs record: {db_err}")
+
+        return {
+            "message": "Stale stores refresh started successfully",
+            "task_id": task_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to start stale stores refresh: {e}")
+        raise HTTPException(500, detail=str(e))
+
+
+@router.post("/scraper/retry")
+async def retry_store(
+    req: RetryStoreRequest,
+    admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
+):
+    """Triggers the scraper for a single store URL."""
+    task_id = str(uuid.uuid4())
+    log_file_path = os.path.join(LOG_DIR, f"{task_id}.log")
+    
+    scraper_script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scraper", "scraper.py")
+    
+    cmd = [
+        r"D:\Product\scraper\venv\Scripts\python.exe",
+        scraper_script,
+        "--url", req.url,
+        "--niche", req.niche or "Unknown",
+        "--country", req.country or "Unknown",
+        "--all-signals"
+    ]
+    
+    try:
+        with open(log_file_path, "w") as log_file:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(scraper_script)
+            )
+        active_tasks[task_id] = process
+
+        # Insert run record in Supabase
+        try:
+            supabase.table("scraper_runs").insert({
+                "task_id": task_id,
+                "niche": req.niche or "Unknown",
+                "country": req.country or "Unknown",
+                "limit_count": 1,
+                "status": "running",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as db_err:
+            logger.error(f"Failed to insert scraper_runs record: {db_err}")
+
+        return {
+            "message": "Retry job started successfully",
+            "task_id": task_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to retry store: {e}")
+        raise HTTPException(500, detail=str(e))
+
+
 @router.get("/scraper/logs/{task_id}")
 async def get_scraper_logs(
     task_id: str,
     limit: int = 200,  # last N lines
     admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
 ):
+    import re
     log_file_path = os.path.join(LOG_DIR, f"{task_id}.log")
 
     if not os.path.exists(log_file_path):
@@ -203,66 +341,167 @@ async def get_scraper_logs(
         }
 
     try:
-        # --- Read last N lines efficiently ---
+        # --- Read all lines for analysis and last N for client ---
         try:
             with open(log_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-                lines = lines[-limit:]
+                all_lines = f.readlines()
+            lines = all_lines[-limit:]
         except Exception:
-            lines = ["Log file is being written..."]
+            all_lines = ["Log file is being written..."]
+            lines = all_lines
 
         # --- Process status ---
-        process = active_tasks.get(task_id)
+        db_status = None
+        started_at_str = None
+        completed_at_str = None
+        try:
+            run_record = supabase.table("scraper_runs").select("*").eq("task_id", task_id).execute()
+            if run_record.data:
+                db_status = run_record.data[0].get("status")
+                started_at_str = run_record.data[0].get("started_at")
+                completed_at_str = run_record.data[0].get("completed_at")
+        except Exception as e:
+            logger.error(f"Failed to fetch scraper_runs record: {e}")
 
+        process = active_tasks.get(task_id)
         if not process:
-            status = "unknown_or_completed"
+            status = db_status or "unknown_or_completed"
         else:
             retcode = process.poll()
             if retcode is None:
                 status = "running"
             else:
-                status = "completed" if retcode == 0 else "failed"
+                if db_status == "aborted":
+                    status = "aborted"
+                else:
+                    status = "completed" if retcode == 0 else "failed"
 
-        # --- DEBUG SUMMARY EXTRACTION ---
+        # --- TELEMETRY & STAGE EXTRACTION ---
         summary = {
-            "total_lines": len(lines),
+            "total_lines": len(all_lines),
             "errors": 0,
             "http_400": 0,
             "http_500": 0,
             "http_202": 0,
             "discovered_urls": 0,
-            "matches_found": 0,
-            "fetch_failures": 0,
+            "validation_domains": 0,
+            "shopify_stores": 0,
+            "scraped_stores": 0,
+            "skipped_stores": 0,
+            "failed_stores": 0,
+            "signals_count": 0,
+            "leads_count": 0,
+            "db_failures": 0,
+            "stage": "Idle",
+            "current_store": "None",
+            "duration_seconds": 0,
         }
 
-        for line in lines:
+        # Keep running counters
+        discovered_urls = 0
+        scraped_stores = 0
+        skipped_stores = 0
+        failed_stores = 0
+        signals_count = 0
+        leads_count = 0
+        db_failures = 0
+        current_store = ""
+
+        # Analyze stage line-by-line
+        all_stages = []
+        current_log_stage = "Idle"
+        for line in all_lines:
             l = line.lower()
+            if "=== phase 1:" in l:
+                current_log_stage = "Discovery"
+            elif "=== phase 2:" in l:
+                current_log_stage = "Store Scraping"
+            elif "=== done" in l:
+                current_log_stage = "Completed"
+            all_stages.append(current_log_stage)
+
+            # Look for [PROGRESS] line
+            m = re.search(r"\[PROGRESS\] Discovered:\s*(\d+)\s*\|\s*Scraped:\s*(\d+)\s*\|\s*Skipped:\s*(\d+)\s*\|\s*Failed:\s*(\d+)\s*\|\s*Signals:\s*(\d+)\s*\|\s*Leads:\s*(\d+)\s*\|\s*DB Failures:\s*(\d+)", line)
+            if m:
+                discovered_urls = int(m.group(1))
+                scraped_stores = int(m.group(2))
+                skipped_stores = int(m.group(3))
+                failed_stores = int(m.group(4))
+                signals_count = int(m.group(5))
+                leads_count = int(m.group(6))
+                db_failures = int(m.group(7))
+
+            # Detect current active store
+            if "match:" in l or "skipping non-shopify" in l or "fetch failed" in l or "processing" in l:
+                words = line.split()
+                for w in words:
+                    if "http" in w or ".com" in w or w.count(".") >= 1:
+                        cleaned = w.strip("():,[]→\"'")
+                        if "." in cleaned and len(cleaned) > 3:
+                            current_store = cleaned
+                            break
 
             if "error" in l:
                 summary["errors"] += 1
-
             if "400 bad request" in l:
                 summary["http_400"] += 1
-
             if "500" in l:
                 summary["http_500"] += 1
-
             if "202 accepted" in l:
                 summary["http_202"] += 1
 
-            if "discovered" in l and "candidate urls" in l:
-                # extract number if possible
-                try:
-                    num = int("".join(filter(str.isdigit, line)))
-                    summary["discovered_urls"] += num
-                except:
-                    pass
+        summary["discovered_urls"] = discovered_urls
+        summary["validation_domains"] = discovered_urls  # all discovered are validated
+        summary["shopify_stores"] = scraped_stores  # scraped shopify stores
+        summary["scraped_stores"] = scraped_stores
+        summary["skipped_stores"] = skipped_stores
+        summary["failed_stores"] = failed_stores
+        summary["signals_count"] = signals_count
+        summary["leads_count"] = leads_count
+        summary["db_failures"] = db_failures
+        summary["stage"] = current_log_stage
+        summary["current_store"] = current_store or "None"
 
-            if "✓ match" in l or "match:" in l:
-                summary["matches_found"] += 1
+        # Calculate duration
+        duration_str = None
+        if started_at_str:
+            try:
+                started_dt = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                if completed_at_str:
+                    completed_dt = datetime.fromisoformat(completed_at_str.replace("Z", "+00:00"))
+                    diff = completed_dt - started_dt
+                else:
+                    now_dt = datetime.now(timezone.utc)
+                    diff = now_dt - started_dt
+                
+                tot_sec = int(diff.total_seconds())
+                minutes, seconds = divmod(tot_sec, 60)
+                duration_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+                summary["duration_seconds"] = tot_sec
+            except Exception as ex:
+                logger.warning("Error calculating duration: %s", ex)
 
-            if "fetch failed" in l:
-                summary["fetch_failures"] += 1
+        # Update database record
+        update_payload = {
+            "status": status,
+            "discovered_urls": discovered_urls,
+            "scraped_stores": scraped_stores,
+            "skipped_stores": skipped_stores,
+            "failed_stores": failed_stores,
+            "signals_count": signals_count,
+            "leads_count": leads_count,
+            "db_failures": db_failures,
+        }
+        if duration_str:
+            update_payload["duration"] = duration_str
+        
+        if status in ["completed", "failed", "aborted"] and not completed_at_str:
+            update_payload["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+        try:
+            supabase.table("scraper_runs").update(update_payload).eq("task_id", task_id).execute()
+        except Exception as e:
+            logger.error(f"Failed to update scraper_runs: {e}")
 
         # --- categorize logs (useful for frontend tabs) ---
         categorized_logs = {
@@ -272,14 +511,16 @@ async def get_scraper_logs(
             "scraper": [],
         }
 
-        for line in lines:
+        line_stages = all_stages[-limit:] if all_lines else []
+        for line, stage_for_line in zip(lines, line_stages):
             l = line.lower()
-
-            if "error" in l:
+            if "error" in l or "fail" in l:
                 categorized_logs["errors"].append(line)
-            elif "http request" in l or "http " in l:
+            elif "http request" in l or "http " in l or "fetch" in l:
                 categorized_logs["http"].append(line)
-            elif "discovery" in l:
+            elif stage_for_line == "Discovery":
+                categorized_logs["discovery"].append(line)
+            elif "discovery" in l or "search" in l or "serpapi" in l:
                 categorized_logs["discovery"].append(line)
             else:
                 categorized_logs["scraper"].append(line)
@@ -304,6 +545,7 @@ async def get_scraper_logs(
 async def abort_scraper(
     task_id: str,
     admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
 ):
     process = active_tasks.get(task_id)
     if not process:
@@ -319,10 +561,41 @@ async def abort_scraper(
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+            
+        # Update database record
+        try:
+            supabase.table("scraper_runs").update({
+                "status": "aborted",
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            }).eq("task_id", task_id).execute()
+        except Exception as db_err:
+            logger.error(f"Failed to mark scraper run as aborted in DB: {db_err}")
+            
         return {"message": "Scraper aborted", "status": "aborted"}
     except Exception as e:
         logger.error("Failed to abort scraper task %s: %s", task_id, e)
         raise HTTPException(status_code=500, detail="Failed to abort scraper task")
+
+
+@router.get("/scraper/history")
+async def get_scraper_history(
+    admin: dict = Depends(get_current_admin),
+    supabase: Client = Depends(get_supabase),
+):
+    try:
+        # Clean up runs older than 30 days
+        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        try:
+            supabase.table("scraper_runs").delete().lt("started_at", thirty_days_ago).execute()
+        except Exception as e:
+            logger.error(f"Failed to auto-cleanup old scraper runs: {e}")
+
+        # Fetch runs sorted by started_at desc
+        res = supabase.table("scraper_runs").select("*").order("started_at", desc=True).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Error fetching scraper history: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch scraper history.")
 
 # --- Endpoints: Signals ---
 from models.admin import SignalCreate, SignalUpdate, LeadStatusUpdate, BulkLeadAction
@@ -353,6 +626,25 @@ async def update_signal(signal_id: str, payload: SignalUpdate, admin: dict = Dep
         data["is_active"] = data.pop("active")
     res = supabase.table("signals").update(data).eq("id", signal_id).execute()
     return res.data[0] if res.data else None
+
+
+@router.post("/signals/recalculate")
+async def recalculate_signals(admin: dict = Depends(get_current_admin)):
+    """Triggers the signals recalculation subprocess."""
+    recalc_script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "scraper", "recalculate.py")
+    cmd = [
+        r"D:\Product\scraper\venv\Scripts\python.exe",
+        recalc_script
+    ]
+    try:
+        subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(recalc_script)
+        )
+        return {"message": "Signals recalculation started in the background."}
+    except Exception as e:
+        logger.error(f"Failed to start recalculation subprocess: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start recalculation: {str(e)}")
 
 # --- Endpoints: Leads ---
 @router.get("/leads")

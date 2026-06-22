@@ -27,6 +27,9 @@ class SignalCreate(BaseModel):
     name: str
     slug: Optional[str] = None
     type: Optional[str] = None
+    category: Optional[str] = None
+    weight: Optional[float] = None
+    dependencies: Optional[List[str]] = None
     description: Optional[str] = None
     rule_definition: Optional[str] = None
     active: Optional[bool] = None
@@ -37,6 +40,9 @@ class SignalUpdate(BaseModel):
     name: Optional[str] = None
     slug: Optional[str] = None
     type: Optional[str] = None
+    category: Optional[str] = None
+    weight: Optional[float] = None
+    dependencies: Optional[List[str]] = None
     description: Optional[str] = None
     rule_definition: Optional[str] = None
     active: Optional[bool] = None
